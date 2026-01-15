@@ -1,0 +1,29 @@
+# Data Configuration
+# API_KEY not needed for yfinance
+
+# Data Settings
+SYMBOLS:
+  - "EURUSD"
+  - "GBPUSD"
+  - "USDJPY"
+TIMEFRAME: "60min"  # 1min, 5min, 15min, 30min, 60min, daily
+OUTPUT_DIR: "data"
+
+# Model Parameters
+LIGHTGBM_PARAMS:
+  objective: "multiclass"
+  num_class: 3
+  metric: "multi_logloss"
+  boosting_type: "gbdt"
+  num_leaves: 31
+  learning_rate: 0.05
+  feature_fraction: 0.9
+
+CNN_PARAMS:
+  sequence_length: 60  # Lookback window size
+  epochs: 50
+  batch_size: 32
+
+# Trading Logic
+TARGET_COLUMN: "close"  # Price column to predict
+PREDICTION_HORIZON: 1   # How many steps ahead to predict
