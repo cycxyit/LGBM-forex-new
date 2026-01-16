@@ -7,6 +7,8 @@ SYMBOLS:
   - "GBPUSD"
   - "USDJPY"
 TIMEFRAME: "60min"  # 1min, 5min, 15min, 30min, 60min, daily
+DATA_SOURCE: "yfinance" # Options: "yfinance", "local_csv"
+CSV_DATA_DIR: "data" # Directory for local CSV files (if DATA_SOURCE is "local_csv")
 OUTPUT_DIR: "data"
 
 # Model Parameters

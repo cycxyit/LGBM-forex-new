@@ -33,6 +33,68 @@ class DataLoader:
             pd.DataFrame with columns [open, high, low, close, volume] indexed by timestamp
             Columns are lowercased to match previous behavior.
         """
+        """
+        Fetch forex data from Yahoo Finance or Local CSV.
+        
+        Args:
+            symbol: Currency pair (e.g., EURUSD)
+            interval: Time interval
+            period: Data period (for yfinance)
+            
+        Returns:
+            pd.DataFrame with columns [open, high, low, close, volume]
+        """
+        data_source = self.config.get("DATA_SOURCE", "yfinance").lower()
+        
+        if data_source == "local_csv":
+            return self._fetch_from_local_csv(symbol)
+        else:
+            return self._fetch_from_yfinance(symbol, interval, period)
+
+    def _fetch_from_local_csv(self, symbol: str) -> pd.DataFrame:
+        """Load data from local CSV."""
+        csv_dir = Path(self.config.get("CSV_DATA_DIR", "data"))
+        # Try both {symbol}.csv and {symbol}_{interval}.csv patterns or just search
+        # User request implies "csv data format (same as yfinance)"
+        
+        # Simple assumption: file named {symbol}.csv
+        file_path = csv_dir / f"{symbol}.csv"
+        
+        if not file_path.exists():
+            print(f"Error: Local file {file_path} not found.")
+            return pd.DataFrame()
+            
+        print(f"Loading local data from {file_path}...")
+        try:
+            df = pd.read_csv(file_path, index_col=0, parse_dates=True)
+            
+            # Standardize columns
+            # Expecting: Open, High, Low, Close, Volume (or lowercase)
+            df.columns = [c.lower() for c in df.columns]
+            
+            required_cols = ["open", "high", "low", "close"]
+            missing = [c for c in required_cols if c not in df.columns]
+            if missing:
+                print(f"Error: Missing columns in {file_path}: {missing}")
+                return pd.DataFrame()
+                
+            # Ensure volume exists (fill 0 if missing)
+            if "volume" not in df.columns:
+                df["volume"] = 0
+                
+            # Keep only standard columns
+            df = df[["open", "high", "low", "close", "volume"]]
+            
+            # Ensure index is datetime and sorted
+            df.sort_index(inplace=True)
+            
+            return df
+        except Exception as e:
+            print(f"Error reading local CSV {file_path}: {e}")
+            return pd.DataFrame()
+
+    def _fetch_from_yfinance(self, symbol: str, interval: str, period: str) -> pd.DataFrame:
+        """Fetch from Yahoo Finance (original logic)"""
         # Map config interval to yfinance interval if necessary
         interval_map = {
             "60min": "1h",
@@ -55,10 +117,7 @@ class DataLoader:
         
         # Check cache first
         cache_file = self.output_dir / f"{symbol}_{interval}.csv"
-        # Optional: Check if cache is fresh enough? For now, we rely on manual deletion or overwrite if forced.
-        # But to be consistent with previous logic, if cache exists, we might want to load it
-        # However, usually we want fresh data. Let's stick to previous behavior: if cache exists, load it.
-        # But wait, previous behavior checked cache first.
+        
         if cache_file.exists():
              print(f"Loading from cache: {cache_file}")
              df = pd.read_csv(cache_file, index_col=0, parse_dates=True)

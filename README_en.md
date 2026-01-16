@@ -49,16 +49,32 @@ You can customize trading pairs, timeframes, and model parameters:
 # API_KEY not needed for yfinance
 
 # Data Settings
+# Data Settings
 SYMBOLS:
   - "EURUSD"
   - "GBPUSD"
 TIMEFRAME: "60min" # Timeframe: 15min, 30min, 60min, daily
+DATA_SOURCE: "yfinance" # Options: "yfinance" or "local_csv"
+CSV_DATA_DIR: "data" # Directory for local CSV files (if DATA_SOURCE is "local_csv")
 OUTPUT_DIR: "data"
 
 # Model Parameters
 CNN_PARAMS:
   sequence_length: 60  # Lookback window length
   epochs: 50
+
+### 2. Using Local CSV Data
+If you want to use your own data, set `DATA_SOURCE` to `local_csv` and place your CSV files in the directory specified by `CSV_DATA_DIR`.
+
+**CSV Filename**: `{SYMBOL}.csv` (e.g., `EURUSD.csv`)
+
+**CSV Format Example** (Must include datetime index and OHLC columns, case-insensitive):
+```csv
+Date,Open,High,Low,Close,Volume
+2023-01-01 00:00:00,1.0700,1.0750,1.0680,1.0720,1000
+2023-01-01 01:00:00,1.0720,1.0740,1.0710,1.0730,1200
+```
+*Note: If Volume column is missing, it will be filled with 0.*
 ```
 
 ---

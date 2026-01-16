@@ -49,16 +49,32 @@ pip install -r requirements.txt
 # API_KEY not needed for yfinance
 
 # 数据设置
+# 数据设置
 SYMBOLS:
   - "EURUSD"
   - "GBPUSD"
 TIMEFRAME: "60min" # 时间周期: 15min, 30min, 60min, daily
+DATA_SOURCE: "yfinance" # 选项: "yfinance" 或 "local_csv"
+CSV_DATA_DIR: "data" # 本地 CSV 文件夹路径 (当 DATA_SOURCE 为 "local_csv" 时生效)
 OUTPUT_DIR: "data"
 
 # 模型参数
 CNN_PARAMS:
   sequence_length: 60  # 回看窗口长度
   epochs: 50
+
+### 2. 使用本地 CSV 数据
+如果您想使用自己的数据，请将 `DATA_SOURCE` 设置为 `local_csv`，并将 CSV 文件放入 `CSV_DATA_DIR` 指定的目录。
+
+**CSV 文件名**: `{SYMBOL}.csv` (例如 `EURUSD.csv`)
+
+**CSV 格式示例** (必须包含 datetime 索引和 OHLC 列，不区分大小写):
+```csv
+Date,Open,High,Low,Close,Volume
+2023-01-01 00:00:00,1.0700,1.0750,1.0680,1.0720,1000
+2023-01-01 01:00:00,1.0720,1.0740,1.0710,1.0730,1200
+```
+*注意：如果没有 Volume 列，系统会自动填充为 0。*
 ```
 
 ---
