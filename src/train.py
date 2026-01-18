@@ -130,13 +130,15 @@ def train_pipeline():
         input_shape = (X_train_c.shape[1], X_train_c.shape[2])
         try:
             cnn_model = trainer.build_cnn(input_shape)
+            cnn_callbacks = trainer.get_callbacks()
             
             cnn_params = config.get("CNN_PARAMS", {})
             cnn_model.fit(
                 X_train_c, y_train_c,
                 validation_data=(X_val_c, y_val_c),
                 epochs=cnn_params.get("epochs", 5),
-                batch_size=cnn_params.get("batch_size", 32)
+                batch_size=cnn_params.get("batch_size", 32),
+                callbacks=cnn_callbacks
             )
             trainer.save_cnn(cnn_model, "models/cnn_model.keras")
             print("CNN saved.")

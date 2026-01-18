@@ -5,8 +5,10 @@ from typing import Tuple
 # Try importing tensorflow/keras, handle if not present (though required)
 try:
     from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import Dense, Conv1D, MaxPooling1D, Flatten, Dropout, Input
+    from tensorflow.keras.layers import Dense, Conv1D, MaxPooling1D, Flatten, Dropout, Input, BatchNormalization
     from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras import regularizers
+    from tensorflow.keras.callbacks import EarlyStopping
     HAS_TF = True
 except ImportError:
     HAS_TF = False
@@ -35,8 +37,6 @@ class ModelFactory:
             params,
             train_data,
             valid_sets=[val_data],
-            # num_boost_round=1000, 
-            # early_stopping_rounds=50, # older lgb versions
             callbacks=[
                 lgb.early_stopping(stopping_rounds=50),
                 lgb.log_evaluation(period=10)
@@ -51,15 +51,21 @@ class ModelFactory:
         if not HAS_TF:
             raise ImportError("TensorFlow not installed.")
             
+        cnn_params = self.config.get("CNN_PARAMS", {})
+        dropout_rate = cnn_params.get("dropout_rate", 0.2)
+        l2_reg = cnn_params.get("l2_regularization", 0.0)
+        
         model = Sequential([
             Input(shape=input_shape),
-            Conv1D(filters=64, kernel_size=3, activation='relu'),
+            Conv1D(filters=64, kernel_size=3, activation='relu', kernel_regularizer=regularizers.l2(l2_reg)),
+            BatchNormalization(),
             MaxPooling1D(pool_size=2),
-            Conv1D(filters=32, kernel_size=3, activation='relu'),
+            Conv1D(filters=32, kernel_size=3, activation='relu', kernel_regularizer=regularizers.l2(l2_reg)),
+            BatchNormalization(),
             MaxPooling1D(pool_size=2),
             Flatten(),
-            Dense(50, activation='relu'),
-            Dropout(0.2),
+            Dense(50, activation='relu', kernel_regularizer=regularizers.l2(l2_reg)),
+            Dropout(dropout_rate),
             Dense(num_classes, activation='softmax')
         ])
         
@@ -67,6 +73,20 @@ class ModelFactory:
                       loss='sparse_categorical_crossentropy',
                       metrics=['accuracy'])
         return model
+    
+    def get_callbacks(self):
+        """Get training callbacks including EarlyStopping"""
+        if not HAS_TF:
+            return []
+            
+        return [
+            EarlyStopping(
+                monitor='val_loss',
+                patience=5,
+                restore_best_weights=True,
+                verbose=1
+            )
+        ]
 
     def save_lgbm(self, model: lgb.Booster, path: str):
         model.save_model(path)
