@@ -7,7 +7,11 @@
 *   **数据获取**: 自动从 Yahoo Finance (`yfinance`) 获取外汇历史数据 (CSV格式)。
 *   **特征工程**: 使用 TA-Lib 计算丰富技术指标 (MACD, RSI, BBANDS, ATR, OBV 等)。
 *   **混合模型**: 结合传统机器学习 (LightGBM) 和深度学习 (1D-CNN) 进行趋势预测 (看涨/看跌/中性)。
-*   **回测系统**: 向量化回测引擎，计算策略收益、夏普比率和最大回撤。
+*   **防数据泄露回测**: 
+    - **严格时间分割**: 强制指定回测起止日期，确保不使用训练数据的未来信息。
+    - **Scaler 隔离**: 强制使用训练阶段保存的标准化器，禁止测试集重新拟合。
+*   **真实成本模拟**: 支持设置点差/手续费（默认 0.5 pips），包含成本的净值曲线更贴近实盘。
+*   **模型集成**: 支持同时使用 LightGBM 和 CNN 预测结果取平均，提高稳健性。
 *   **实时 API**: 基于 FastAPI 的 REST 接口，提供实时交易信号。
 
 ---
@@ -43,25 +47,30 @@ pip install -r requirements.txt
 ## ⚙️ 配置说明
 
 ### 1. 修改配置文件 (`config/config.yaml`)
-您可以自定义交易对、时间周期和模型参数：
+您可以在此文件中全量配置交易系统：
+
 ```yaml
 # Data Configuration
-# API_KEY not needed for yfinance
-
-# 数据设置
-# 数据设置
 SYMBOLS:
   - "EURUSD"
   - "GBPUSD"
-TIMEFRAME: "60min" # 时间周期: 15min, 30min, 60min, daily
+TIMEFRAME: "60min" # 时间周期: 1min, 5min, 15min, 30min, 60min, daily
 DATA_SOURCE: "yfinance" # 选项: "yfinance" 或 "local_csv"
-CSV_DATA_DIR: "data" # 本地 CSV 文件夹路径 (当 DATA_SOURCE 为 "local_csv" 时生效)
-OUTPUT_DIR: "data"
 
 # 模型参数
+LIGHTGBM_PARAMS:
+  # ... (LGBM 参数)
 CNN_PARAMS:
-  sequence_length: 60  # 回看窗口长度
-  epochs: 50
+  sequence_length: 60  # CNN 回看窗口长度
+
+# 回测配置 (Backtest Settings) - NEW!
+BACKTEST:
+  START_DATE: "2025-01-01"   # 回测开始日期 (YYYY-MM-DD)
+  END_DATE: "2025-12-31"     # 回测结束日期
+  INITIAL_BALANCE: 10000.0   # 初始资金
+  TRANSACTION_COST: 0.00005  # 交易成本 (例如 0.5 pips = 0.00005 价格单位)
+  ENSEMBLE: true             # 是否启用模型集成 (LGBM + CNN)
+```
 
 ### 2. 使用本地 CSV 数据
 如果您想使用自己的数据，请将 `DATA_SOURCE` 设置为 `local_csv`，并将 CSV 文件放入 `CSV_DATA_DIR` 指定的目录。
@@ -75,57 +84,64 @@ Date,Open,High,Low,Close,Volume
 2023-01-01 01:00:00,1.0720,1.0740,1.0710,1.0730,1200
 ```
 *注意：如果没有 Volume 列，系统会自动填充为 0。*
-```
 
 ---
 
-## 🏃‍♂️ 快速开始 (使用教程)
+## 🏃‍♂️ 详细使用教程
 
-### 步骤 1: 训练模型 (Train)
-运行训练流水线，它将自动下载数据、预处理、训练 LightGBM 和 CNN 模型，并保存到 `models/` 目录。
+### 第一步: 训练模型 (Train)
+运行训练流水线。此步骤将：
+1. 下载或加载历史数据。
+2. 计算技术指标。
+3. **保存 Scaler**: 将训练集拟合的 Scaler 保存到 `models/scaler.pkl` (关键！)。
+4. 训练 LightGBM 和 CNN (如果安装了 TensorFlow)。
+5. 保存模型到 `models/` 目录。
 
 ```bash
-python src/train_pipeline.py
-# 注意：train_pipeline.py 实际文件名可能是 src/train.py，请查看目录下文件。
-# 根据当前文件结构，运行：
 python src/train.py
 ```
-*输出：模型文件 (`lgbm_model.txt`, `cnn_model.keras`) 和 缩放器 (`scaler.pkl`) 将保存在 `models/` 文件夹中。*
+*输出：`models/` 文件夹下生成 `lgbm_model.txt`, `cnn_model.keras` 和 `scaler.pkl`。*
 
-### 步骤 2: 策略回测 (Backtest)
-使用历史数据测试策略表现。
+### 第二步: 策略回测 (Backtest)
+使用**从未见过**的数据进行回测。回测引擎会自动加载第一步保存的模型和 Scaler，严格避免数据泄露。
+
+1. 确保 `config.yaml` 中的 `BACKTEST` 日期范围没有在训练集中使用过（虽然代码不做强制检查，但建议人工划分，例如 2020-2022 训练，2023 测试）。
+2. 运行回测：
 
 ```bash
-python src/backtest.py
+# 推荐使用模块方式运行，避免路径报错
+python -m src.backtest
 ```
-*输出：将在 `data/` 目录下生成回测资金曲线图 (`EURUSD_backtest.png`)，并在控制台输出 ROI 和夏普比率。*
 
-### 步骤 3: 启动 API 服务 (Inference)
+**回测输出:**
+- 控制台打印详细指标：
+    - **Net Profit**: 扣除交易成本后的净利润。
+    - **ROI**: 投资回报率。
+    - **Sharpe Ratio**: 夏普比率 (年化)。
+    - **Max Drawdown**: 最大回撤。
+    - **Trades**: 交易次数。
+- 图片结果：`data/{SYMBOL}_backtest.png` (包含资金曲线对比)。
+
+### 第三步: 启动 API 服务 (Inference)
 启动本地预测服务，用于接入交易终端或前端展示。
 
 ```bash
 uvicorn src.api:app --reload
 ```
 *   服务启动后，访问文档：[http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
-*   获取预测接口示例：
-    ```
-    GET http://127.0.0.1:8000/predict/EURUSD
+*   **获取预测接口**:
+    ```http
+    GET /predict/EURUSD
     ```
     **响应示例**:
     ```json
     {
       "symbol": "EURUSD",
+      "timestamp": "2023-10-27T14:00:00Z",
       "predictions": {
-        "lightgbm": {
-          "bearish_prob": 0.1,
-          "neutral_prob": 0.2,
-          "bullish_prob": 0.7,
-          "signal": "Bullish"
-        },
-        "cnn": { ... },
-        "ensemble": {
-          "signal": "Bullish"
-        }
+        "dataset": "valid",
+        "ensemble_signal": "Bullish",
+        "confidence": 0.65
       }
     }
     ```
@@ -137,13 +153,13 @@ uvicorn src.api:app --reload
 ```
 Gemini/2.0/
 ├── config/             # 配置文件
-│   └── config.yaml
+│   └── config.yaml     # 核心配置 (参数、回测设置)
 ├── data/               # 存放下载的数据和回测结果图片
 ├── models/             # 存放训练好的模型 (LightGBM, CNN) 和 Scaler
 ├── notebooks/          # Jupyter Notebooks (用于 Colab 实验)
 ├── src/                # 源代码
 │   ├── api.py          # FastAPI 接口服务
-│   ├── backtest.py     # 回测引擎
+│   ├── backtest.py     # 优化后的回测引擎
 │   ├── data_loader.py  # 数据加载与缓存
 │   ├── models.py       # 模型定义 (Model Factory)
 │   ├── preprocessing.py# 特征工程与数据预处理
