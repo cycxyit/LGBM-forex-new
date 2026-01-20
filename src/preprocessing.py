@@ -201,6 +201,21 @@ class DataPreprocessor:
             batch_size=batch_size,
             shuffle=shuffle,
         )
+        
+        # Explicitly set shapes to avoid "unknown shape" errors in Graph execution, 
+        # especially for Flatten layers which need to know non-batch dims.
+        # X shape: (None, lookback, n_features)
+        # y shape: (None,)
+        
+        n_features = X.shape[1]
+        
+        def set_shapes(x, y):
+            x.set_shape([None, lookback, n_features])
+            y.set_shape([None])
+            return x, y
+            
+        dataset = dataset.map(set_shapes)
+        
         return dataset
 
 if __name__ == "__main__":
