@@ -125,6 +125,84 @@ class DataPreprocessor:
             ys.append(y[i + lookback])
         return np.array(Xs), np.array(ys)
 
+    def create_tf_dataset(self, X, y, lookback: int = 60, batch_size: int = 32, shuffle: bool = False):
+        """
+        Create a tf.data.Dataset using timeseries_dataset_from_array.
+        This generates sequences on-the-fly, saving huge amounts of RAM.
+        """
+        try:
+            from tensorflow.keras.utils import timeseries_dataset_from_array
+        except ImportError:
+            raise ImportError("TensorFlow not installed.")
+            
+        # y needs to be aligned. 
+        # timeseries_dataset_from_array produces batch of (X_seq, y_target)
+        # It takes the target corresponding to the END of the sequence.
+        # So we pass y starting from 'lookback' index?
+        # No, the API default is: yields (data[i:i+seq_len], targets[i+seq_len]) if configured?
+        # Actually API is: timeseries_dataset_from_array(data, targets, ...)
+        # If we want target[i+lookback] associated with data[i:i+lookback],
+        # we should treat 'targets' argument carefully.
+        
+        # Standard usage:
+        # data: Array of shape (N, features)
+        # targets: Array of shape (N,) or None. 
+        # sequence_length: L
+        # sequence_stride: 1
+        # sampling_rate: 1
+        # shuffle: bool
+        
+        # If targets is provided, the dataset yields (batch_data, batch_targets).
+        # Where batch_data[j] = data[i:i+L]
+        # And batch_targets[j] = targets[i] ?? No.
+        # Documentation: "The targets corresponding to each sequence starting at index i... is targets[i]?"
+        # Usually for "predict next step", we want target at time t+1 for window t-L..t
+        
+        # Let's align explicitly to be sure:
+        # We want X[i : i+lookback] to predict y[i+lookback]
+        # So we slice y to start at 'lookback'.
+        # And we stop generating X when we run out of y.
+        # But `timeseries_dataset_from_array` aligns by index.
+        # If data[i] starts the sequence, targets[i] is the target? That's usually not what we want for "next step".
+        # We want the target for the sequence ending at i+L.
+        
+        # Proper alignment:
+        # Pass `targets` shifted by `lookback`?
+        # Actually simpler: 
+        # Just manually slice targets so they align with the START of the window?
+        # If dataset yields Sequence[i] = data[i : i+L]
+        # We want Target[i] to be y[i + L]
+        # So we pass `targets = y[lookback:]`.
+        # And we limit data to `data[:-lookback]`? 
+        # Let's verify lengths.
+        # len(y_sliced) = N - lookback.
+        # We want N - lookback sequences.
+        # Dataset will stop when it runs out of targets.
+        
+        # So:
+        # data = X
+        # targets = y[lookback:] (padded with something at start?)
+        # Let's try:
+        # targets = np.concatenate([np.zeros(lookback)*np.nan, y]) ? No that breaks types.
+        
+        # Correct approach with this API:
+        # Use `end_index` parameter to limit where sequences start.
+        # But alignment of target is key.
+        # If we pass targets=y[lookback:], then index 0 of targets corresponds to index 0 of the dataset.
+        # Index 0 of dataset is sequence starting at X[0].
+        # Sequence X[0:L] -> predicts y[L].
+        # Target[0] is y[lookback] -> y[L].
+        # Match!
+        
+        dataset = timeseries_dataset_from_array(
+            data=X,
+            targets=y[lookback:], 
+            sequence_length=lookback,
+            batch_size=batch_size,
+            shuffle=shuffle,
+        )
+        return dataset
+
 if __name__ == "__main__":
     # Test stub
     pass

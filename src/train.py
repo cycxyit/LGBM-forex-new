@@ -33,8 +33,12 @@ def train_pipeline():
     symbols = config.get("SYMBOLS", ["EURUSD"])
     interval = config.get("TIMEFRAME", "60min")
     seq_len = config.get("CNN_PARAMS", {}).get("sequence_length", 60)
+    batch_size = config.get("CNN_PARAMS", {}).get("batch_size", 32)
+    cnn_epochs = config.get("CNN_PARAMS", {}).get("epochs", 5)
     
-    # 1. Collect and Process Data
+    # 1. Collect Data (Keep as list of DF for now - metadata overhead is low)
+    # If even this is too big (e.g. 50 years of data), we'd need to stream from disk.
+    # For 5 years @ 1h/1m, holding raw DFs in RAM is usually fine (hundreds of MBs).
     processed_dfs = []
     print("Fetching and processing data...")
     
@@ -60,98 +64,140 @@ def train_pipeline():
         print("No valid data found for any symbol.")
         return
 
-    # 2. Fit Scaler locally on ALL data stacked
-    print("Fitting scaler...")
-    all_features = []
+    # 2. Fit Scaler Incrementally (partial_fit) on chunks
+    print("Fitting scaler incrementally...")
     # Assume all DFs have same columns
     feature_cols = [c for c in processed_dfs[0].columns if c not in ['target', 'date']]
     
     for df in processed_dfs:
-        all_features.append(df[feature_cols].values)
+        X = df[feature_cols].values
+        # Partial fit expects 2D array
+        preprocessor.scaler.partial_fit(X)
         
-    big_X = np.concatenate(all_features)
-    preprocessor.scaler.fit(big_X)
-    print(f"Scaler fitted on {len(big_X)} samples.")
+    print("Scaler fitted.")
     
-    # 3. Transform and Prepare Datasets
-    all_X_lgbm = []
-    all_y_lgbm = []
-    all_X_cnn = []
-    all_y_cnn = []
+    # Save Scaler early
+    with open("models/scaler.pkl", "wb") as f:
+        pickle.dump(preprocessor.scaler, f)
+    print("Scaler saved.")
+
+    # 3. Transform and Prepare Datasets (LGBM in-memory, CNN via Generators)
+    full_X_lgbm_train = []
+    full_y_lgbm_train = []
+    full_X_lgbm_val = []
+    full_y_lgbm_val = []
+    
+    train_datasets = []
+    val_datasets = []
+    
+    # Check for TensorFlow availability
+    from src.models import HAS_TF
+    if HAS_TF:
+        import tensorflow as tf
+    else:
+        print("TensorFlow not found. CNN will be skipped.")
     
     for df in processed_dfs:
         X = df[feature_cols].values
         y = df['target'].values
         
-        # Transform
+        # Transform (Now safe to transform since scaler is fitted)
         X_scaled = preprocessor.scaler.transform(X)
         
-        # LGBM Data (Simple rows)
-        all_X_lgbm.append(X_scaled)
-        all_y_lgbm.append(y)
+        # Split into Train/Val by time (e.g. 80/20)
+        split_idx = int(len(X_scaled) * 0.8)
         
-        # CNN Data (Sequences)
-        # We need enough data for at least one sequence
-        if len(X_scaled) > seq_len:
-            Xs, ys = preprocessor.create_sequences(X_scaled, y, lookback=seq_len)
-            all_X_cnn.append(Xs)
-            all_y_cnn.append(ys)
+        X_train = X_scaled[:split_idx]
+        y_train = y[:split_idx]
+        X_val = X_scaled[split_idx:]
+        y_val = y[split_idx:]
         
-    if not all_X_lgbm:
-        print("Not enough data for training.")
-        return
+        # --- LGBM Data Collection ---
+        full_X_lgbm_train.append(X_train)
+        full_y_lgbm_train.append(y_train)
+        full_X_lgbm_val.append(X_val)
+        full_y_lgbm_val.append(y_val)
+        
+        # --- CNN Dataset Creation ---
+        if HAS_TF and len(X_train) > seq_len:
+             # Train Dataset
+             ds_train = preprocessor.create_tf_dataset(
+                 X_train, y_train, 
+                 lookback=seq_len, 
+                 batch_size=batch_size, 
+                 shuffle=True
+             )
+             train_datasets.append(ds_train)
+             
+             # Val Dataset
+             if len(X_val) > seq_len:
+                 ds_val = preprocessor.create_tf_dataset(
+                     X_val, y_val, 
+                     lookback=seq_len, 
+                     batch_size=batch_size, 
+                     shuffle=False
+                 )
+                 val_datasets.append(ds_val)
 
-    X_lgbm = np.concatenate(all_X_lgbm)
-    y_lgbm = np.concatenate(all_y_lgbm)
-    
-    if all_X_cnn:
-        X_cnn = np.concatenate(all_X_cnn)
-        y_cnn = np.concatenate(all_y_cnn)
-    else:
-        print("Warning: No data for CNN (sequences too short?)")
-        X_cnn = np.array([])
-        y_cnn = np.array([])
-    
-    # Split
-    X_train_l, X_val_l, y_train_l, y_val_l = train_test_split(X_lgbm, y_lgbm, test_size=0.2, shuffle=False)
-    
-    # Train LightGBM
-    print("Training LightGBM...")
-    lgbm_model = trainer.train_lightgbm(X_train_l, y_train_l, X_val_l, y_val_l)
-    trainer.save_lgbm(lgbm_model, "models/lgbm_model.txt")
-    print("LightGBM saved.")
-    
-    # Train CNN (Only if TF is available)
-    from src.models import HAS_TF
-    if HAS_TF and len(X_cnn) > 0:
-        X_train_c, X_val_c, y_train_c, y_val_c = train_test_split(X_cnn, y_cnn, test_size=0.2, shuffle=False)
+    # 4. Train LightGBM
+    if full_X_lgbm_train:
+        print("Training LightGBM...")
+        X_train_l = np.concatenate(full_X_lgbm_train)
+        y_train_l = np.concatenate(full_y_lgbm_train)
+        X_val_l = np.concatenate(full_X_lgbm_val)
+        y_val_l = np.concatenate(full_y_lgbm_val)
         
+        lgbm_model = trainer.train_lightgbm(X_train_l, y_train_l, X_val_l, y_val_l)
+        trainer.save_lgbm(lgbm_model, "models/lgbm_model.txt")
+        print("LightGBM saved.")
+        
+        # Free memory
+        del X_train_l, y_train_l, X_val_l, y_val_l
+        import gc; gc.collect()
+    else:
+        print("No data for LightGBM.")
+
+    # 5. Train CNN
+    if HAS_TF and train_datasets:
         print("Training CNN...")
-        input_shape = (X_train_c.shape[1], X_train_c.shape[2])
+        # Combine datasets
+        final_train_ds = train_datasets[0]
+        for ds in train_datasets[1:]:
+            final_train_ds = final_train_ds.concatenate(ds)
+            
+        # Shuffle global dataset roughly
+        final_train_ds = final_train_ds.shuffle(buffer_size=1000)
+            
+        final_val_ds = None
+        if val_datasets:
+            final_val_ds = val_datasets[0]
+            for ds in val_datasets[1:]:
+                final_val_ds = final_val_ds.concatenate(ds)
+        
+        # Build Model
+        # Input shape: (seq_len, features)
+        # We can get features from feature_cols length
+        n_features = len(feature_cols)
+        input_shape = (seq_len, n_features)
+        
         try:
             cnn_model = trainer.build_cnn(input_shape)
             cnn_callbacks = trainer.get_callbacks()
             
-            cnn_params = config.get("CNN_PARAMS", {})
             cnn_model.fit(
-                X_train_c, y_train_c,
-                validation_data=(X_val_c, y_val_c),
-                epochs=cnn_params.get("epochs", 5),
-                batch_size=cnn_params.get("batch_size", 32),
+                final_train_ds,
+                validation_data=final_val_ds,
+                epochs=cnn_epochs,
                 callbacks=cnn_callbacks
             )
             trainer.save_cnn(cnn_model, "models/cnn_model.keras")
             print("CNN saved.")
         except Exception as e:
             print(f"CNN training failed: {e}")
+            import traceback
+            traceback.print_exc()
     else:
-        print("Skipping CNN training (TensorFlow not found or no data).")
-
-    
-    # Save Scaler for Inference
-    with open("models/scaler.pkl", "wb") as f:
-        pickle.dump(preprocessor.scaler, f)
-    print("Scaler saved.")
+        print("Skipping CNN training (No data or TF missing).")
 
 if __name__ == "__main__":
     train_pipeline()
