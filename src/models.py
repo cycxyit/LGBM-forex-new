@@ -4,11 +4,12 @@ from typing import Tuple
 
 # Try importing tensorflow/keras, handle if not present (though required)
 try:
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import Dense, Conv1D, MaxPooling1D, Flatten, Dropout, Input, BatchNormalization
+    from tensorflow.keras.models import Model, Sequential
+    from tensorflow.keras.layers import (Dense, Conv1D, MaxPooling1D, Flatten, Dropout, Input, 
+                                       BatchNormalization, Add, Activation, GlobalAveragePooling1D)
     from tensorflow.keras.optimizers import Adam
     from tensorflow.keras import regularizers
-    from tensorflow.keras.callbacks import EarlyStopping
+    from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
     HAS_TF = True
 except ImportError:
     HAS_TF = False
@@ -44,30 +45,63 @@ class ModelFactory:
         )
         return model
 
+    def _residual_block(self, x, filters, kernel_size=3, stride=1, l2_reg=0.0):
+        shortcut = x
+        
+        # First Conv
+        x = Conv1D(filters, kernel_size, strides=stride, padding='same', 
+                  kernel_regularizer=regularizers.l2(l2_reg))(x)
+        x = BatchNormalization()(x)
+        x = Activation('relu')(x)
+        
+        # Second Conv
+        x = Conv1D(filters, kernel_size, strides=1, padding='same', 
+                  kernel_regularizer=regularizers.l2(l2_reg))(x)
+        x = BatchNormalization()(x)
+        
+        # Adjust shortcut if dimensions don't match
+        if x.shape[-1] != shortcut.shape[-1]:
+            shortcut = Conv1D(filters, 1, strides=stride, padding='same')(shortcut)
+            
+        x = Add()([x, shortcut])
+        x = Activation('relu')(x)
+        return x
+
     def build_cnn(self, input_shape: Tuple[int, int], num_classes: int = 3):
         """
-        Build 1D-CNN Model
+        Build ResNet-1D Model
         """
         if not HAS_TF:
             raise ImportError("TensorFlow not installed.")
             
         cnn_params = self.config.get("CNN_PARAMS", {})
-        dropout_rate = cnn_params.get("dropout_rate", 0.2)
-        l2_reg = cnn_params.get("l2_regularization", 0.0)
+        dropout_rate = cnn_params.get("dropout_rate", 0.3)
+        l2_reg = cnn_params.get("l2_regularization", 0.001)
         
-        model = Sequential([
-            Input(shape=input_shape),
-            Conv1D(filters=64, kernel_size=3, activation='relu', kernel_regularizer=regularizers.l2(l2_reg)),
-            BatchNormalization(),
-            MaxPooling1D(pool_size=2),
-            Conv1D(filters=32, kernel_size=3, activation='relu', kernel_regularizer=regularizers.l2(l2_reg)),
-            BatchNormalization(),
-            MaxPooling1D(pool_size=2),
-            Flatten(),
-            Dense(50, activation='relu', kernel_regularizer=regularizers.l2(l2_reg)),
-            Dropout(dropout_rate),
-            Dense(num_classes, activation='softmax')
-        ])
+        inputs = Input(shape=input_shape)
+        
+        # Initial Conv
+        x = Conv1D(64, 7, strides=2, padding='same', kernel_regularizer=regularizers.l2(l2_reg))(inputs)
+        x = BatchNormalization()(x)
+        x = Activation('relu')(x)
+        x = MaxPooling1D(3, strides=2, padding='same')(x)
+        
+        # Residual Blocks
+        x = self._residual_block(x, 64, l2_reg=l2_reg)
+        x = self._residual_block(x, 64, l2_reg=l2_reg)
+        
+        x = self._residual_block(x, 128, stride=2, l2_reg=l2_reg)
+        x = self._residual_block(x, 128, l2_reg=l2_reg)
+        
+        x = self._residual_block(x, 256, stride=2, l2_reg=l2_reg)
+        x = self._residual_block(x, 256, l2_reg=l2_reg)
+        
+        # Global Pooling and Output
+        x = GlobalAveragePooling1D()(x)
+        x = Dropout(dropout_rate)(x)
+        outputs = Dense(num_classes, activation='softmax')(x)
+        
+        model = Model(inputs, outputs)
         
         model.compile(optimizer=Adam(learning_rate=0.001),
                       loss='sparse_categorical_crossentropy',
@@ -82,8 +116,15 @@ class ModelFactory:
         return [
             EarlyStopping(
                 monitor='val_loss',
-                patience=5,
+                patience=10, # Increased patience for better convergence
                 restore_best_weights=True,
+                verbose=1
+            ),
+            ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.5,
+                patience=5,
+                min_lr=1e-6,
                 verbose=1
             )
         ]
