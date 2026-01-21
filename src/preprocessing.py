@@ -118,11 +118,102 @@ class DataPreprocessor:
         return X, y
 
     def create_sequences(self, X, y, lookback: int = 60):
-        """Create sequences for CNN/LSTM [samples, time_steps, features]"""
+        """Create standard sequences [samples, time_steps, features]"""
         Xs, ys = [], []
+        if len(X) < lookback:
+            return np.array([]), np.array([])
+            
         for i in range(len(X) - lookback):
             Xs.append(X[i:(i + lookback)])
             ys.append(y[i + lookback])
+        return np.array(Xs), np.array(ys)
+
+    def create_normalized_sequences(self, df: pd.DataFrame, target_col: str, lookback: int = 60, feature_cols: list = None):
+        """
+        Create locally normalized sequences for CNN.
+        Normalization: sequence / sequence[0] (relative to start of window)
+        
+        Args:
+            df: DataFrame containing raw OHLCV data
+            target_col: Name of target column
+            lookback: Window size
+            feature_cols: List of columns to use (must include Close to normalize properly)
+            
+        Returns:
+            X: (N, lookback, features)
+            y: (N,)
+        """
+        if feature_cols is None:
+            # Default to basic OHLCV if available
+            possible_cols = ['open', 'high', 'low', 'close', 'volume', 'tick_volume']
+            feature_cols = [c for c in possible_cols if c in df.columns]
+            
+        if not feature_cols:
+            raise ValueError("No feature columns found for sequence creation")
+
+        data = df[feature_cols].values
+        targets = df[target_col].values
+        
+        Xs, ys = [], []
+        
+        # We need 'close' index to normalize volume if needed, or just normalize everything by its own start?
+        # Suggestion: sequence / sequence[0] for prices. 
+        # For volume, dividing by vol[0] is okay but vol[0] might be 0.
+        # Alternatively: Log volume? Or just global scale volume?
+        # Let's try simple division for prices, and global scale for volume?
+        # Suggestion said: "sequence_normalized = sequence / close_0" for prices.
+        
+        # Identification of price columns vs volume
+        price_indices = [i for i, c in enumerate(feature_cols) if c.lower() in ['open', 'high', 'low', 'close']]
+        
+        # Avoid division by zero
+        validation_epsilon = 1e-8
+        
+        for i in range(len(data) - lookback):
+            # Raw sequence: shape (lookback, n_features)
+            seq = data[i:(i + lookback)].astype(np.float32)
+            
+            # Local Normalization
+            # 1. Prices: divide by first Close (or Open?) -> usually first Close of window
+            # But we only have column indices.
+            # Let's assume we normalize each column by its own first value?
+            # No, correct way for OHLC is normalize ALL by the FIRST CLOSE (so relationships are preserved).
+            
+            # Find close column index for this row
+            try:
+                # Assuming 'close' is in feature_cols
+                close_idx = feature_cols.index('close')
+                base_price = seq[0, close_idx]
+            except ValueError:
+                 # Fallback: use first column (Open?)
+                 base_price = seq[0, 0]
+            
+            if base_price < validation_epsilon:
+                base_price = 1.0 # Prevent div by zero
+                
+            # Copy to avoid modifying original array if it's a view
+            seq_norm = seq.copy()
+            
+            # Normalize Price Columns
+            if price_indices:
+                seq_norm[:, price_indices] = seq_norm[:, price_indices] / base_price
+                
+            # Normalize Volume (if present) - Global log1p or local relative?
+            # Local relative volume is also good: vol / (avg_vol of window) or vol / vol[0]
+            # Simple approach: vol / (vol[0] + eps)
+            other_indices = [idx for idx in range(len(feature_cols)) if idx not in price_indices]
+            for idx in other_indices:
+                base_val = seq_norm[0, idx]
+                if base_val < validation_epsilon:
+                     # If first vol is 0, add 1? or just leave it?
+                     # Add 1 to everything?
+                     seq_norm[:, idx] = np.log1p(seq_norm[:, idx]) # Log transform volume is safer usually
+                else:
+                     seq_norm[:, idx] = seq_norm[:, idx] / base_val
+            
+            Xs.append(seq_norm)
+            ys.append(targets[i + lookback])
+            
         return np.array(Xs), np.array(ys)
 
     def create_tf_dataset(self, X, y, lookback: int = 60, batch_size: int = 32, shuffle: bool = False):

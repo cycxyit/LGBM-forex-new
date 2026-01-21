@@ -69,7 +69,7 @@ class ModelFactory:
 
     def build_cnn(self, input_shape: Tuple[int, int], num_classes: int = 3):
         """
-        Build ResNet-1D Model
+        Build Simplified CNN for Feature Extraction (Functional API)
         """
         if not HAS_TF:
             raise ImportError("TensorFlow not installed.")
@@ -78,35 +78,53 @@ class ModelFactory:
         dropout_rate = cnn_params.get("dropout_rate", 0.3)
         l2_reg = cnn_params.get("l2_regularization", 0.001)
         
+        # Functional API for easy layer access
         inputs = Input(shape=input_shape)
         
-        # Initial Conv
-        x = Conv1D(64, 7, strides=2, padding='same', kernel_regularizer=regularizers.l2(l2_reg))(inputs)
-        x = BatchNormalization()(x)
-        x = Activation('relu')(x)
-        x = MaxPooling1D(3, strides=2, padding='same')(x)
+        # 1. Feature Extraction Blocks
+        x = Conv1D(32, kernel_size=5, activation='relu', padding='same',
+                   kernel_regularizer=regularizers.l2(l2_reg))(inputs)
+        x = MaxPooling1D(pool_size=2)(x)
         
-        # Residual Blocks
-        x = self._residual_block(x, 64, l2_reg=l2_reg)
-        x = self._residual_block(x, 64, l2_reg=l2_reg)
+        x = Conv1D(64, kernel_size=3, activation='relu', padding='same',
+                   kernel_regularizer=regularizers.l2(l2_reg))(x)
+        x = MaxPooling1D(pool_size=2)(x)
         
-        x = self._residual_block(x, 128, stride=2, l2_reg=l2_reg)
-        x = self._residual_block(x, 128, l2_reg=l2_reg)
-        
-        x = self._residual_block(x, 256, stride=2, l2_reg=l2_reg)
-        x = self._residual_block(x, 256, l2_reg=l2_reg)
-        
-        # Global Pooling and Output
+        # 2. Global Aggregation
         x = GlobalAveragePooling1D()(x)
-        x = Dropout(dropout_rate)(x)
-        outputs = Dense(num_classes, activation='softmax')(x)
         
-        model = Model(inputs, outputs)
+        # 3. Dense Feature Layer (The Embedding)
+        # Naming this layer makes it easier to extract later if needed by name, 
+        # though we can also just cut the model.
+        features = Dense(32, activation='relu', kernel_regularizer=regularizers.l2(l2_reg), name='feature_dense')(x)
+        
+        # 4. Classification Head
+        x = Dropout(dropout_rate)(features)
+        outputs = Dense(num_classes, activation='softmax', name='prediction')(x)
+        
+        model = Model(inputs=inputs, outputs=outputs)
         
         model.compile(optimizer=Adam(learning_rate=0.001),
                       loss='sparse_categorical_crossentropy',
                       metrics=['accuracy'])
         return model
+
+    def get_feature_extractor(self, model):
+        """
+        Returns a new model that outputs the embeddings from the 'feature_dense' layer.
+        """
+        if not HAS_TF:
+            return None
+        
+        try:
+            # Try getting by name
+            feature_layer = model.get_layer('feature_dense')
+            return Model(inputs=model.input, outputs=feature_layer.output)
+        except ValueError:
+            # Fallback: assume it's the 3rd to last layer (before Dropout and Softmax) or similar
+            # But relying on structure is brittle. Since we built it, we know the name.
+            print("Could not find 'feature_dense' layer. Returning model as is (verify architecture).")
+            return model
     
     def get_callbacks(self):
         """Get training callbacks including EarlyStopping"""

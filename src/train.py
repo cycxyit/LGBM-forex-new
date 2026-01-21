@@ -2,27 +2,26 @@ import yaml
 import numpy as np
 import pandas as pd
 import pickle
+import gc
 from pathlib import Path
-from sklearn.model_selection import train_test_split
 from src.data_loader import DataLoader
 from src.preprocessing import DataPreprocessor
-from src.models import ModelFactory
+from src.models import ModelFactory, HAS_TF
 
 def robust_load_config(path: str = "config/config.yaml") -> dict:
     try:
         with open(path, "r") as f:
             return yaml.safe_load(f)
     except FileNotFoundError:
-        # Fallback default config if file is missing (e.g. in tests)
         return {
             "SYMBOLS": ["EURUSD"],
-            "TIMEFRAME": "1h",
+            "TIMEFRAME": "60min",
             "LIGHTGBM_PARAMS": {"objective": "multiclass", "num_class": 3, "verbose": -1},
-            "CNN_PARAMS": {"sequence_length": 60, "epochs": 5, "batch_size": 32}
+            "CNN_PARAMS": {"sequence_length": 60, "epochs": 20, "batch_size": 32}
         }
 
 def train_pipeline():
-    # Load Config
+    print("Starting Hybrid CNN-LGBM Training Pipeline...")
     config = robust_load_config()
     
     # Initialize
@@ -32,172 +31,231 @@ def train_pipeline():
     
     symbols = config.get("SYMBOLS", ["EURUSD"])
     interval = config.get("TIMEFRAME", "60min")
-    seq_len = config.get("CNN_PARAMS", {}).get("sequence_length", 60)
-    batch_size = config.get("CNN_PARAMS", {}).get("batch_size", 32)
-    cnn_epochs = config.get("CNN_PARAMS", {}).get("epochs", 5)
+    cnn_params = config.get("CNN_PARAMS", {})
+    seq_len = cnn_params.get("sequence_length", 60)
+    batch_size = cnn_params.get("batch_size", 32)
+    cnn_epochs = cnn_params.get("epochs", 20)
     
-    # 1. Collect Data (Keep as list of DF for now - metadata overhead is low)
-    # If even this is too big (e.g. 50 years of data), we'd need to stream from disk.
-    # For 5 years @ 1h/1m, holding raw DFs in RAM is usually fine (hundreds of MBs).
-    processed_dfs = []
-    print("Fetching and processing data...")
+    # 1. Load and Preprocess Data per Symbol
+    # We will combine all symbols for training
+    full_data = [] # List of (df, symbol)
     
+    print("Step 1: Fetching Data...")
     for symbol in symbols:
         df = loader.fetch_data(symbol, interval=interval)
         if df.empty:
-            print(f"Skipping {symbol} (no data)")
             continue
-            
-        # Add indicators
+        
+        # Add Technical Indicators (For LGBM)
         df = preprocessor.add_technical_indicators(df)
         
-        # Create targets
-        df = preprocessor.create_labels(df)
+        # Create Labels (For both)
+        df = preprocessor.create_labels(df, horizon=1)
         
-        if df.empty:
-             print(f"Skipping {symbol} (empty after processing)")
-             continue
-             
-        processed_dfs.append(df)
-            
-    if not processed_dfs:
-        print("No valid data found for any symbol.")
+        if len(df) > seq_len + 100: # Minimum size check
+            full_data.append(df)
+        else:
+            print(f"Skipping {symbol}: Not enough data.")
+
+    if not full_data:
+        print("No valid data loaded.")
         return
 
-    # 2. Fit Scaler Incrementally (partial_fit) on chunks
-    print("Fitting scaler incrementally...")
-    # Assume all DFs have same columns
-    feature_cols = [c for c in processed_dfs[0].columns if c not in ['target', 'date']]
+    # 2. Strict Time-Based Splitting & Scaler Fitting
+    # Strategy: 
+    # - Split each symbol's timeline into Train (80%) and Val (20%).
+    # - Fit Scaler only on Train parts.
     
-    for df in processed_dfs:
-        X = df[feature_cols].values
-        # Partial fit expects 2D array
-        preprocessor.scaler.partial_fit(X)
+    print("Step 2: Splitting and Scaling...")
+    train_dfs = []
+    val_dfs = []
+    
+    # Identify Feature Columns
+    # CNN: Raw OHLCV
+    cnn_features = ['open', 'high', 'low', 'close', 'volume']
+    if 'tick_volume' in full_data[0].columns:
+         cnn_features = ['open', 'high', 'low', 'close', 'tick_volume']
+         
+    # LGBM: Tech Indicators + Time features?
+    # Exclude targets and date
+    exclude_cols = ['target', 'date', 'open', 'high', 'low', 'close', 'volume', 'tick_volume']
+    lgbm_base_features = [c for c in full_data[0].columns if c not in exclude_cols]
+    
+    # Fit Scaler on Concatenated Train Data
+    # We need to collect all train data first
+    all_train_features = []
+    
+    for df in full_data:
+        split_idx = int(len(df) * 0.8)
+        train_df = df.iloc[:split_idx].copy()
+        val_df = df.iloc[split_idx:].copy()
         
-    print("Scaler fitted.")
+        train_dfs.append(train_df)
+        val_dfs.append(val_df)
+        
+        all_train_features.append(train_df[lgbm_base_features].values)
+        
+    # Fit Scaler (Global for LGBM features)
+    preprocessor.scaler.fit(np.concatenate(all_train_features))
+    del all_train_features
     
-    # Save Scaler early
+    # Save Scaler
+    Path("models").mkdir(exist_ok=True)
     with open("models/scaler.pkl", "wb") as f:
         pickle.dump(preprocessor.scaler, f)
-    print("Scaler saved.")
-
-    # 3. Transform and Prepare Datasets (LGBM in-memory, CNN via Generators)
-    full_X_lgbm_train = []
-    full_y_lgbm_train = []
-    full_X_lgbm_val = []
-    full_y_lgbm_val = []
+        
+    print(f"Scaler fitted. LGBM Base Features: {len(lgbm_base_features)}")
     
-    train_datasets = []
-    val_datasets = []
+    # 3. Prepare CNN Datasets & Arrays
+    print("Step 3: Preparing CNN Data (Local Normalization)...")
     
-    # Check for TensorFlow availability
-    from src.models import HAS_TF
+    X_cnn_train = []
+    y_cnn_train = []
+    X_cnn_val = []
+    y_cnn_val = []
+    
+    # Also keep track of indices to align LGBM
+    # We will generate arrays for LGBM in Step 5
+    
+    for df in train_dfs:
+        X_seq, y_seq = preprocessor.create_normalized_sequences(
+            df, 'target', lookback=seq_len, feature_cols=cnn_features
+        )
+        if len(X_seq) > 0:
+            X_cnn_train.append(X_seq)
+            y_cnn_train.append(y_seq)
+            
+    for df in val_dfs:
+        X_seq, y_seq = preprocessor.create_normalized_sequences(
+            df, 'target', lookback=seq_len, feature_cols=cnn_features
+        )
+        if len(X_seq) > 0:
+            X_cnn_val.append(X_seq)
+            y_cnn_val.append(y_seq)
+            
+    if not X_cnn_train:
+        print("Error: No training data generated.")
+        return
+        
+    X_cnn_train = np.concatenate(X_cnn_train)
+    y_cnn_train = np.concatenate(y_cnn_train)
+    X_cnn_val = np.concatenate(X_cnn_val)
+    y_cnn_val = np.concatenate(y_cnn_val)
+    
+    print(f"CNN Train Shape: {X_cnn_train.shape}, Val Shape: {X_cnn_val.shape}")
+    
+    # 4. Train CNN (Feature Extractor)
     if HAS_TF:
-        import tensorflow as tf
+        print("Step 4: Training CNN Feature Extractor...")
+        input_shape = (seq_len, X_cnn_train.shape[2])
+        cnn_model = trainer.build_cnn(input_shape, num_classes=3)
+        
+        # Use simple FIT for now (converting to Dataset internally or using array fit)
+        # For large data, we used Generators, but robust fit is okay for moderate size
+        callbacks = trainer.get_callbacks()
+        
+        cnn_model.fit(
+            X_cnn_train, y_cnn_train,
+            validation_data=(X_cnn_val, y_cnn_val),
+            epochs=cnn_epochs,
+            batch_size=batch_size,
+            callbacks=callbacks,
+            verbose=1
+        )
+        
+        trainer.save_cnn(cnn_model, "models/cnn_model.keras")
+        
+        # 4b. Extract Features
+        print("Extracting CNN Features...")
+        feature_extractor = trainer.get_feature_extractor(cnn_model)
+        
+        # Get embeddings
+        # We need embeddings for BOTH Train and Val to train LGBM
+        # Note: We must ensure alignment matches X_cnn_train/val
+        
+        cnn_feat_train = feature_extractor.predict(X_cnn_train, batch_size=batch_size)
+        cnn_feat_val = feature_extractor.predict(X_cnn_val, batch_size=batch_size)
+        
+        print(f"CNN Embeddings shape: {cnn_feat_train.shape}")
+        
     else:
-        print("TensorFlow not found. CNN will be skipped.")
+        print("TensorFlow missing. Skipping CNN Phase.")
+        return
+
+    # 5. Prepare LGBM Data (Align with CNN)
+    print("Step 5: preparing LGBM Data & Fusion...")
     
-    for df in processed_dfs:
-        X = df[feature_cols].values
-        y = df['target'].values
+    def get_aligned_lgbm_features(dfs_list):
+        features_list = []
+        targets_list = []
         
-        # Transform (Now safe to transform since scaler is fitted)
-        X_scaled = preprocessor.scaler.transform(X)
-        
-        # Split into Train/Val by time (e.g. 80/20)
-        split_idx = int(len(X_scaled) * 0.8)
-        
-        X_train = X_scaled[:split_idx]
-        y_train = y[:split_idx]
-        X_val = X_scaled[split_idx:]
-        y_val = y[split_idx:]
-        
-        # --- LGBM Data Collection ---
-        full_X_lgbm_train.append(X_train)
-        full_y_lgbm_train.append(y_train)
-        full_X_lgbm_val.append(X_val)
-        full_y_lgbm_val.append(y_val)
-        
-        # --- CNN Dataset Creation ---
-        if HAS_TF and len(X_train) > seq_len:
-             # Train Dataset
-             ds_train = preprocessor.create_tf_dataset(
-                 X_train, y_train, 
-                 lookback=seq_len, 
-                 batch_size=batch_size, 
-                 shuffle=True
-             )
-             train_datasets.append(ds_train)
-             
-             # Val Dataset
-             if len(X_val) > seq_len:
-                 ds_val = preprocessor.create_tf_dataset(
-                     X_val, y_val, 
-                     lookback=seq_len, 
-                     batch_size=batch_size, 
-                     shuffle=False
-                 )
-                 val_datasets.append(ds_val)
+        for df in dfs_list:
+            # We need to take rows corresponding to the END of sequences
+            # sequence[i] uses indices i..i+seq_len-1
+            # We want LGBM features at i+seq_len-1
+            # And target at i+seq_len
+            
+            # create_normalized_sequences returns y at i+seq_len.
+            # So targets are aligned.
+            
+            # We need features from df.iloc[seq_len-1 : -1] ??
+            # Loops i=0 to len-seq_len
+            # Last seq index = (len-seq_len-1) + seq_len-1 = len-2
+            # So features range: index (seq_len-1) to (len-2)
+            
+            # Verify lengths: N = len(df) - seq_len
+            # feature slice length: (len-2) - (seq_len-1) + 1 = len - seq_len. Matches N.
+            
+            # Transform Features first
+            X_base = df[lgbm_base_features].values
+            X_base_scaled = preprocessor.scaler.transform(X_base)
+            
+            # Slice
+            # Indices: seq_len-1, seq_len, ..., len-2
+            # Slice: [seq_len-1 : -1]
+            # (Note: -1 index is the LAST element, usually we want up to len-1 exclusive?
+            # No, we want UP TO len-2 (inclusive).
+            # Python slice [start : end_exclusive].
+            # Target indices were i+seq_len. Max i = len-seq_len-1. Max Target idx = len-1.
+            # Corresponding feature idx = len-2. (One step before target).
+            # Slice [seq_len-1 : -1] excludes the last element (len-1). So it ends at len-2. Correct.
+            
+            X_aligned = X_base_scaled[seq_len-1 : -1]
+            features_list.append(X_aligned)
+            
+        return np.concatenate(features_list)
 
-    # 4. Train LightGBM
-    if full_X_lgbm_train:
-        print("Training LightGBM...")
-        X_train_l = np.concatenate(full_X_lgbm_train)
-        y_train_l = np.concatenate(full_y_lgbm_train)
-        X_val_l = np.concatenate(full_X_lgbm_val)
-        y_val_l = np.concatenate(full_y_lgbm_val)
-        
-        lgbm_model = trainer.train_lightgbm(X_train_l, y_train_l, X_val_l, y_val_l)
-        trainer.save_lgbm(lgbm_model, "models/lgbm_model.txt")
-        print("LightGBM saved.")
-        
-        # Free memory
-        del X_train_l, y_train_l, X_val_l, y_val_l
-        import gc; gc.collect()
-    else:
-        print("No data for LightGBM.")
-
-    # 5. Train CNN
-    if HAS_TF and train_datasets:
-        print("Training CNN...")
-        # Combine datasets
-        final_train_ds = train_datasets[0]
-        for ds in train_datasets[1:]:
-            final_train_ds = final_train_ds.concatenate(ds)
-            
-        # Shuffle global dataset roughly
-        final_train_ds = final_train_ds.shuffle(buffer_size=1000)
-            
-        final_val_ds = None
-        if val_datasets:
-            final_val_ds = val_datasets[0]
-            for ds in val_datasets[1:]:
-                final_val_ds = final_val_ds.concatenate(ds)
-        
-        # Build Model
-        # Input shape: (seq_len, features)
-        # We can get features from feature_cols length
-        n_features = len(feature_cols)
-        input_shape = (seq_len, n_features)
-        
-        try:
-            cnn_model = trainer.build_cnn(input_shape)
-            cnn_callbacks = trainer.get_callbacks()
-            
-            cnn_model.fit(
-                final_train_ds,
-                validation_data=final_val_ds,
-                epochs=cnn_epochs,
-                callbacks=cnn_callbacks
-            )
-            trainer.save_cnn(cnn_model, "models/cnn_model.keras")
-            print("CNN saved.")
-        except Exception as e:
-            print(f"CNN training failed: {e}")
-            import traceback
-            traceback.print_exc()
-    else:
-        print("Skipping CNN training (No data or TF missing).")
+    X_lgbm_base_train = get_aligned_lgbm_features(train_dfs)
+    X_lgbm_base_val = get_aligned_lgbm_features(val_dfs)
+    
+    # Verify Shapes
+    assert len(X_lgbm_base_train) == len(cnn_feat_train), f"Shape mismatch: LGBM {len(X_lgbm_base_train)} vs CNN {len(cnn_feat_train)}"
+    
+    # FUSION
+    X_final_train = np.hstack([X_lgbm_base_train, cnn_feat_train])
+    X_final_val = np.hstack([X_lgbm_base_val, cnn_feat_val])
+    
+    # Targets are already aggregated in step 3
+    y_final_train = y_cnn_train
+    y_final_val = y_cnn_val
+    
+    print(f"Final Training Data Shape: {X_final_train.shape}")
+    
+    # 6. Train LGBM
+    print("Step 6: Training LightGBM...")
+    
+    lgbm_model = trainer.train_lightgbm(
+        X_final_train, y_final_train,
+        X_final_val, y_final_val
+    )
+    
+    trainer.save_lgbm(lgbm_model, "models/lgbm_model.txt")
+    print("Hybrid Training Complete!")
 
 if __name__ == "__main__":
-    train_pipeline()
+    try:
+        train_pipeline()
+    except Exception as e:
+        print(f"Pipeline Failed: {e}")
+        import traceback
+        traceback.print_exc()
