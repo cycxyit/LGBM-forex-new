@@ -84,9 +84,8 @@ class Backtester:
         print(f"Data loaded: {len(df)} candles.")
 
         # 3. Preprocessing
+        # 3. Preprocessing
         # Lookback for indicators matching training
-        # Note: Indicators might need previous data. Ideally we load more data and then cut, 
-        # but for simplicity we assume start_date has enough buffer or we accept small loss at start.
         df = self.preprocessor.add_technical_indicators(df)
         df = self.preprocessor.create_labels(df)
         
@@ -97,48 +96,135 @@ class Backtester:
             print("Error: DataFrame empty after preprocessing.")
             return
 
-        feature_cols = [c for c in df.columns if c not in ['target', 'date', 'signal', 'position', 'strategy_returns', 'market_returns']]
-        X, y = self.preprocessor.prepare_for_training(df, feature_cols, fit_scaler=False)
+        # Prepare Features matching src/train.py logic
+        # 1. LGBM Base Features (Tech Indicators)
+        exclude_cols = ['target', 'date', 'open', 'high', 'low', 'close', 'volume', 'tick_volume', 'signal', 'position', 'strategy_returns', 'market_returns']
+        lgbm_base_features = [c for c in df.columns if c not in exclude_cols]
         
-        # 4. Generate Predictions
-        lgbm_probs = None
-        cnn_probs = None
+        # Validate Scaler Features
+        # Warning: If columns in backtest differ from training (e.g. order), this will fail or be wrong.
+        # Ideally we save the feature name list.
+        # For now, we assume same TA-Lib generation.
         
-        if self.lgbm_model:
-            lgbm_probs = self.lgbm_model.predict(X) 
-            
-        if self.cnn_model:
-            seq_len = self.config.get("CNN_PARAMS", {}).get("sequence_length", 60)
-            if len(X) > seq_len:
-                Xs, _ = self.preprocessor.create_sequences(X, y, lookback=seq_len)
-                # Padding for the first `seq_len` rows where CNN can't predict
-                # We align predictions to the END of the sequence
-                cnn_preds = self.cnn_model.predict(Xs, verbose=0)
-                
-                # Create full buffer for alignment
-                cnn_probs = np.zeros((len(X), 3))
-                cnn_probs[seq_len:] = cnn_preds
-            else:
-                 print("Warning: Not enough data for CNN sequence length.")
-
-        # Ensemble Logic
-        final_probs = None
+        X_lgbm_base = df[lgbm_base_features].values
         
-        if self.do_ensemble and lgbm_probs is not None and cnn_probs is not None:
-            # Simple Average
-            final_probs = (lgbm_probs + cnn_probs) / 2
-            # Zero out the first `seq_len` of ensemble since CNN was 0
-            # Alternatively, fallback to LGBM for first rows
-            final_probs[:60] = lgbm_probs[:60] 
-        elif lgbm_probs is not None:
-            final_probs = lgbm_probs
-        elif cnn_probs is not None:
-            final_probs = cnn_probs
-        else:
-            print("Critical: No models available for prediction.")
+        try:
+            X_lgbm_base_scaled = self.preprocessor.scaler.transform(X_lgbm_base)
+        except ValueError as e:
+            print(f"Scaler Mismatch: {e}")
+            print(f"Expected {self.preprocessor.scaler.n_features_in_} features, got {X_lgbm_base.shape[1]}")
+            print(f"Columns: {lgbm_base_features}")
             return
 
-        signals = np.argmax(final_probs, axis=1)
+        # 2. CNN Features (Raw OHLCV)
+        cnn_features = ['open', 'high', 'low', 'close', 'volume']
+        if 'tick_volume' in df.columns:
+             cnn_features = ['open', 'high', 'low', 'close', 'tick_volume']
+             
+        seq_len = self.config.get("CNN_PARAMS", {}).get("sequence_length", 60)
+        
+        # We need alignment. 
+        # CNN seq at index i uses data [i : i+seq_len].
+        # LGBM needs features at index i+seq_len-1 (end of sequence).
+        # We predict for target at i+seq_len.
+        
+        # Generate CNN sequences
+        # Note: create_normalized_sequences returns y at i+seq_len
+        # We don't need y for inference, but we need X.
+        # We can use the same function and ignore y.
+        
+        X_cnn_seq, _ = self.preprocessor.create_normalized_sequences(
+            df, 'target', lookback=seq_len, feature_cols=cnn_features
+        )
+        
+        if len(X_cnn_seq) == 0:
+            print("Not enough data for CNN sequences.")
+            return
+            
+        # Align LGBM features
+        # X_cnn_seq[0] corresponds to df index 0..seq_len-1.
+        # Prediction is for next candle (feature vector at seq_len-1).
+        # We need X_lgbm_base_scaled at indices correspoding to END of sequences.
+        # If loop i goes 0..N, sequence is i..i+seq_len. End is i+seq_len-1.
+        
+        # Slicing: [seq_len-1 : ]
+        # Length check:
+        # X_cnn_seq length = len(df) - seq_len.
+        # X_lgbm_base_scaled[seq_len-1 : -1] ?? 
+        # In train.py we did [seq_len-1 : -1] because we had targets up to len-1.
+        # Here we just want to predict for all available sequences.
+        # Last sequence: i = len(df) - seq_len - 1. End = len(df) - 2.
+        # Wait, create_normalized_sequences loop: range(len(X) - lookback).
+        # Max i = len - lookback - 1.
+        # Sequence: i .. i+lookback.
+        # Xs[last] = data[len-lookback-1 : len-1].
+        # Length of that is lookback.
+        # End index in df is len-1.
+        # So we need LGBM feature at index len-1.
+        
+        # Slice X_lgbm_base_scaled to match X_cnn_seq.
+        # If X_cnn_seq[k] ends at index k + seq_len - 1.
+        # We want X_lgbm_base_scaled[k + seq_len - 1].
+        # So slice X_lgbm_base_scaled from seq_len-1 to end.
+        
+        start_idx = seq_len - 1
+        X_lgbm_aligned = X_lgbm_base_scaled[start_idx : start_idx + len(X_cnn_seq)]
+        
+        # Verify
+        if len(X_lgbm_aligned) != len(X_cnn_seq):
+             # This happens if integer math is slightly off or specific loop range
+             # create_normalized_sequences len = N - seq_len.
+             # start_idx = seq_len - 1.
+             # Remaining = N - (seq_len - 1) = N - seq_len + 1.
+             # One extra? 
+             # Let's truncate to min length.
+             min_len = min(len(X_lgbm_aligned), len(X_cnn_seq))
+             X_lgbm_aligned = X_lgbm_aligned[:min_len]
+             X_cnn_seq = X_cnn_seq[:min_len]
+
+        # 4. Hybrid Prediction
+        final_probs = None
+        
+        if self.cnn_model and self.lgbm_model:
+            # a) Extract CNN Embeddings
+            # We need the feature extractor part of the model
+            # Re-build or get layer? 
+            # In backtest we loaded the full model.
+            try:
+                from tensorflow.keras.models import Model
+                feature_layer = self.cnn_model.get_layer('feature_dense')
+                feature_extractor = Model(inputs=self.cnn_model.input, outputs=feature_layer.output)
+                
+                cnn_embeddings = feature_extractor.predict(X_cnn_seq, verbose=0)
+                
+                # b) Fuse
+                X_final = np.hstack([X_lgbm_aligned, cnn_embeddings])
+                
+                # c) Predict LGBM
+                final_probs = self.lgbm_model.predict(X_final)
+                
+            except Exception as e:
+                print(f"Hybrid prediction failed: {e}")
+                import traceback
+                traceback.print_exc()
+                return
+        else:
+            print("Models not loaded correctly for Hybrid mode.")
+            return
+
+        # Align signals back to DataFrame
+        # We lost `start_idx` rows at the start.
+        # Fill them with 0 or NaNs.
+        
+        full_probs = np.zeros((len(df), 3))
+        # Fill the tail
+        # slice: [start_idx : start_idx + len]
+        full_probs[start_idx : start_idx + len(final_probs)] = final_probs
+        
+        signals = np.argmax(full_probs, axis=1)
+        # Force 0/1 signal to 0 for the warm-up period
+        signals[:start_idx] = 1 # Neutral/Hold
+
         
         # 5. Calculate Returns
         df['signal'] = signals
